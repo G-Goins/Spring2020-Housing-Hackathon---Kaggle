@@ -1,0 +1,580 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,collapse=TRUE)
+library(arules)
+library(discretization)
+library(caret)
+library(regclass)
+library(parallel)
+library(doParallel)
+
+summary(TRAIN)
+hist(TRAIN$logpickups)
+hist(10^TRAIN$logpickups)
+summary(10^TRAIN$logpickups - 1)
+summary(TRAIN$pickup_dt)
+hist(TRAIN$spd)
+
+summary(KAGGLE)
+
+UBER <- rbind(TRAIN,KAGGLE)
+
+#Do your stuff!
+#Convert pickup_dt into a date object, extract out useful information, then NULL it out
+
+library(lubridate)
+
+hourofpickup <- hour(UBER$pickup_dt)
+dayofweekpickup <- wday(UBER$pickup_dt)
+dayofmonthpickup <- day(UBER$pickup_dt)
+monthofpickup <- month(UBER$pickup_dt)
+yearofpickup <- year(UBER$pickup_dt)
+dayofyearpickup <- yday(UBER$pickup_dt)
+
+
+UBER$hourofpickup <- hourofpickup
+UBER$dayofweekpickup <- dayofweekpickup
+UBER$dayofmonthpickup <- dayofmonthpickup
+UBER$monthofpickup <- monthofpickup
+UBER$yearofpickup <- yearofpickup
+UBER$dayofyearpickup <- dayofyearpickup
+
+UBER$pickup_dt <- NULL
+
+
+#cleaning
+TRAIN.CLEAN <- UBER[1:nrow(TRAIN),]
+KAGGLE.CLEAN <- UBER[-(1:nrow(TRAIN)),]
+summary(TRAIN.CLEAN)
+summary(KAGGLE.CLEAN)
+
+#turning on parallelization
+cluster <- makeCluster(detectCores() - 1) 
+registerDoParallel(cluster) 
+#turning off parallelization
+stopCluster(cluster) 
+registerDoSEQ() 
+
+#Suggested way to estimate generalization errors
+fitControl <- trainControl(method="cv",number=5, allowParallel = TRUE) 
+
+
+library(caret)
+
+#basicGLM
+
+fitControl <- trainControl(method="cv",number=5, allowParallel = TRUE) 
+set.seed(1001001); GLM <- train(logpickups~.,data=TRAIN.CLEAN,method='glm',
+                            trControl=fitControl,preProc=c("center", "scale") )
+GLM$results  #0.05969068 
+
+
+sd(TRAIN.CLEAN$logpickups)
+
+predictions <- predict(GLM, newdata = KAGGLE.CLEAN)
+TO.SUBMIT <- data.frame(IDno=KAGGLE.CLEAN$IDno, logpickups = predictions)
+head(TO.SUBMIT)
+
+write.csv(TO.SUBMIT,file = "basicGLM.csv",row.names = FALSE)
+
+
+glmnetGrid <- expand.grid(alpha = seq(0,1,.05),lambda = 10^seq(-4,-1,length=10))   
+set.seed(1001001); GLMnet <- train(logpickups~.,data=TRAIN.CLEAN,method='glmnet',
+                            trControl=fitControl,preProc=c("center", "scale") )
+GLMnet$results[rownames(GLMnet$logpickups),]   #0.05675802
+
+predictions <- predict(GLMnet, newdata = KAGGLE.CLEAN)
+TO.SUBMIT <- data.frame(IDno=KAGGLE.CLEAN$IDno, logpickups = predictions)
+write.csv(TO.SUBMIT,file = "basicGLM.csv",row.names = FALSE)
+
+#forestmodel
+
+
+forestGrid <- expand.grid(mtry=round(seq(1,65,length=6)))  #put in values 
+FOREST <- train(logpickups~.,data=TRAIN.CLEAN,method='rf',tuneGrid=forestGrid,
+                               trControl=fitControl, preProc = c("center", "scale"))
+FOREST$results[rownames(FOREST$bestTune),]
+
+#boostedtree
+
+gbmGrid <- expand.grid(n.trees=c(2500,5000,10000), interaction.depth=1:4,shrinkage=c(.01,001), n.minobsinnode=c(2,5))
+set.seed(27); GBM <- train(logpickups~., data = TRAIN.CLEAN, method = 'gbm',tuneGrid=gbmGrid,verbose=FALSE,trControl=fitControl,preProc = c("center","scale"))
+
+GBM$results[rownames(GBM$bestTune),]
+
+predictions <- predict(GBM, newdata = KAGGLE.CLEAN)
+TO.SUBMIT <- data.frame(IDno=KAGGLE.CLEAN$IDno, logpickups=predictions)
+write.csv(TO.SUBMIT, file = "boostedtree.csv", row.names = FALSE)
+
+
+#Step 1 - fix eta at 0.01, the rest of parameters at these values, and tune nrounds
+xgboostGrid <- expand.grid(eta=0.3,nrounds=142,
+                           max_depth=2,min_child_weight=1,gamma=0,colsample_bytree=0.8,subsample=1)
+
+set.seed(479); XTREME <- train(logpickups~.,data=TRAIN.CLEAN,
+                method="xgbTree",
+                trControl=fitControl,
+                tuneGrid=xgboostGrid,
+                preProc = c("center", "scale"),
+                verbose=FALSE)
+
+
+
+XTREME$results[,c(7,8,10)]  #Just the columns we want
+
+
+TRAINXGB <- TRAIN.CLEAN
+#Convert data into sparse model matrix; the -1 is important for bookkeeping
+TRAINXGB <- sparse.model.matrix(logpickups~.-1,data=TRAINXGB)
+
+install.packages(xgboost)
+library(xgboost)
+
+XTREM2 <- xgboost(data = TRAINXGB, label = TRAIN.CLEAN$logpickups, max_depth = 2, eta=0.3, min_child_weight=1, gamma=0, colsample_bytree=0.8,nrounds=142, subsample=1.0)
+
+
+
+
+
+
+
+#Step 2, leave eta fixed at 0.1, use "optimal" nrounds from step 1, tune the othe parameters 
+
+xgboostGrid <- expand.grid(eta=0.1,nrounds=500,
+                           max_depth=c(3,6,9),min_child_weight=1,gamma=c(.1,.5,1,5,10),
+                           colsample_bytree=c(0.6,0.8,1),subsample=c(0.6,0.8,1.0))
+dim(xgboostGrid) #135 models yikes
+
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+
+set.seed(479);  XTREME <- train(x=TRAINXGB,y=TRAIN$logpickups,
+                method="xgbTree",
+                trControl=fitControl,
+                tuneGrid=xgboostGrid,
+                preProc = c("center", "scale"),
+                verbose=FALSE)
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+
+TUNE <- XTREME$results[,c(2,3,4,6,8,10)]
+head( TUNE[order(TUNE$logpickups,decreasing=TRUE),], 15 )
+#    max_depth gamma colsample_bytree subsample  Accuracy AccuracySD
+#97          9   0.1                1       0.6 0.8982652 0.02145847
+#116         9   1.0                1       0.8 0.8948170 0.02075917
+#106         9   0.5                1       0.6 0.8948036 0.02274355
+#54          6   0.1                1       1.0 0.8948023 0.01974425
+
+
+#Step 3:  Lower the learning rate eta to a smaller value, uses the values of the other parameters from step 2, re-tune number of trees
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+
+xgboostGrid <- expand.grid(eta=0.01,nrounds=c(250,500,1000,2500,5000),
+                           max_depth=9,min_child_weight=1,gamma=1,colsample_bytree=1,subsample=.6)
+FINE.XTREME <- train(logpickups~.,data=TRAIN.CLEAN,method='glm',
+                            trControl=fitControl,preProc=c("center", "scale") )
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+#  nrounds  Accuracy   Kappa    
+#   250     0.8800143  0.7469844
+#   500     0.8844564  0.7552670
+#  1000     0.8938403  0.7754157
+#  2500     0.8933441  0.7746320
+#  5000     0.8913675  0.7704410
+
+#Step 4:  keep eta fixed at that smaller value, use "optimal" value of nrounds from step 3, and retune the other parameters
+xgboostGrid <- expand.grid(eta=0.01,nrounds=2500,
+                           max_depth=c(7,9,11),min_child_weight=1,gamma=c(0,.1,1),
+                           colsample_bytree=c(.8,1),subsample=.6)
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+
+FINE.XTREME2 <- train(logpickups~.,data=TRAIN.CLEAN,method='glm',
+                            trControl=fitControl,preProc=c("center", "scale") )
+stopCluster(cluster) 
+registerDoSEQ() 
+
+
+#Can iterate steps 3 and 4 until happy.  But this takes a long time
+
+
+#Once done, can get predictions on the holdout sample
+classifications <- predict(FINE.XTREME2,newdata=TRAIN.CLEAN)
+confusionMatrix(classifications,TRAIN.CLEAN$logpickups)
+#          Reference
+#Prediction high low
+#      high  243  27
+#      low    35 370
+#Accuracy : 0.9081     
+probabilities <- predict(FINE.XTREME2,newdata=TRAIN.CLEAN,type="prob")
+roc(HOLDOUT$Quality,probabilities[,2])
+#Area under the curve: 0.9693
+
+
+summary(GLMnet)
+
+
+
+
+
+
+```
+
+## Loading in and Cleaning
+
+Load in `HOUSINGHACK.RData` (this .Rmd file and the .RData file both need to be downloaded and in the same folder)
+
+```{r load in data}
+load("HOUSINGHACK.RData")
+```
+
+Your overall goal is to develop a model that makes accurate predictions regarding the `SalePrice` column (the log10 of the selling price of a home in Ames, IA).  You'll see `TRAIN` and `TEST`.  You will be auditioning and evaluating models using 1000 homes in `TRAIN` (since you have the values of `SalePrice` for them), and you'll be submitting predictions for the sale prices of 460 homes in `TEST`.  
+
+The description of each data field (most are pretty intuitive) can be found in `data_description.txt` up on Canvas.  There are some integrity issues and some preprocessing that of course has to happen before an effective model is built:  quite a few missing values and rare levels.  You'll need to do the preprocessing on the `TRAIN` and `TEST` sets together, then resplit them.  See example code below.
+
+```{r basic data manipulation}
+HOUSE <- rbind(TRAIN,TEST)  #Combine datasets so that first set of rows is training and second set of rows is test
+
+#Create a nice summary of names, types, and missing valueness
+SUMMARY <- data.frame(Variable=names(HOUSE),
+           type=unlist(lapply(HOUSE,class)),
+           missing=unlist(lapply(HOUSE,function(x)length(which(is.na(x))))))
+SUMMARY
+
+
+##Missing value strategy example
+
+#Replace missing values in factors with the level NoneMissing
+for(i in which(SUMMARY$type=="factor") ) {
+  levels(HOUSE[,i]) <- c(levels(HOUSE[,i]),"NoneMissing")
+  HOUSE[which(is.na(HOUSE[,i])),i] <- "NoneMissing"
+}
+
+#Replace missing values in numerical columns with 0 (could do median, etc., this is just quick)
+for(i in which(SUMMARY$type!="factor") ) {
+  if(names(HOUSE)[i]=="SalePrice") { next } #if the SalePrice column, don't replace anything here
+  HOUSE[which(is.na(HOUSE[,i])),i] <- median(HOUSE[,i],na.rm=TRUE)
+}
+
+#Values for every quantity for every house (except SalePrice)!
+mean(complete.cases(HOUSE[,-81]))
+
+
+summary(HOUSE)  #A lot of rare levels
+
+HOUSE.CLEAN <- HOUSE  #Create copy to store cleaned version
+
+#Combine rare levels of PoolQC
+HOUSE.CLEAN$PoolQC <- combine_rare_levels(HOUSE.CLEAN$PoolQC,threshold=50)$values
+summary(HOUSE.CLEAN$PoolQC)  #oops, all the same, should remove it (we will in a sec)
+
+
+categoricals <- which( unlist( lapply(HOUSE.CLEAN,function(x)tail(class(x),1) ) ) == "factor" )  #make a vector containing positions of categorical variables
+for (i in categoricals) {  #loop through each column of HOUSE
+  HOUSE.CLEAN[,i] <- combine_rare_levels(HOUSE[,i],threshold=50)$values #combine all levels that appear 50 times or fewer
+}
+
+#Take out any columns which now only have a single level
+only.1.level <- which( unlist(lapply(HOUSE.CLEAN,nlevels)) == 1 )
+HOUSE.CLEAN <- HOUSE.CLEAN[,-only.1.level]
+
+
+#Plenty of room for more cleaning here, especially with transformations
+infodensity <- nearZeroVar(HOUSE.CLEAN, saveMetrics= TRUE)
+infodensity[infodensity$nzv,][1:5,]  #dataframe of measures 
+zero.variance <- which( nearZeroVar(HOUSE.CLEAN, saveMetrics= TRUE)$zeroVar == TRUE )
+near.zero.variance <- which( nearZeroVar(HOUSE.CLEAN, saveMetrics= TRUE)$nzv == TRUE )
+HOUSE.CLEAN <- HOUSE.CLEAN[,-c(zero.variance,near.zero.variance) ]
+dim(HOUSE.CLEAN) #Before:  81 columns
+
+#Explore highly correlated or redundant predictors
+#Put a minus sign before the column number that contains the y variable
+numerics <- which( unlist(lapply(HOUSE.CLEAN,function(x) tail(class(x),1))  %in% c("numeric","integer") ) )
+highlycorrelated <- findCorrelation( cor(HOUSE.CLEAN[,numerics]) , cutoff = .90)
+highlycorrelated #columns that are highly correlated with each other; none
+all_correlations(HOUSE.CLEAN[,numerics],sorted="magnitude")
+comboInfo <- findLinearCombos(HOUSE.CLEAN[complete.cases(HOUSE.CLEAN),numerics])
+comboInfo$remove  #in this case, didn't find any!
+
+
+##Recover TRAIN and TEST, but call the different things
+TRAIN.CLEAN <- HOUSE.CLEAN[1:1000,]
+TEST.CLEAN <- HOUSE.CLEAN[1001:1460,]
+```
+
+
+##  Model Building
+
+Figure out what model you'd like to use.  Once this is done, make predictions on the `TEST.CLEAN` data, then save the column of IDs and predicted values to a .csv file and upload that into kaggle.  The following example shows an extremely basic model, but is useful for seeing how to save the predictions correctly.
+
+
+```{r modeling}
+
+#Suggestion:  check out the PredictiveAnalyticsToolbox and follow the birthweight example in terms of how to fit those models
+#The structure here is very similar.  The question is:  what parameters of each model are going to work best?  You could change 
+#the search grids.
+
+#Note:  the one command that WON'T work is postResample because you aren't privy to the answers on the holdout (I made them all NA!)
+
+
+
+
+
+treeGrid <- expand.grid(cp=10^seq(-5,-1,length=25))
+
+set.seed(479); TREE <- train(SalePrice~.,data=TRAIN.CLEAN,method='rpart', tuneGrid=treeGrid,
+                             trControl=fitControl, preProc = c("center", "scale"))
+TREE$results[rownames(TREE$bestTune),]  #0.08259759
+BEST.PARAMS$RPART <- TREE$bestTune
+
+
+forestGrid <- expand.grid(mtry=round(seq(1,65,length=6)))  #put in values 
+FOREST <- train(SalePrice~.,data=TRAIN.CLEAN,method='rf',tuneGrid=forestGrid,
+                               trControl=fitControl, preProc = c("center", "scale"))
+FOREST$results[rownames(FOREST$bestTune),]  #0.05963794
+
+
+
+
+
+
+
+gbmGrid <- expand.grid(n.trees=c(250,500,1000),interaction.depth=1:4,shrinkage=c(.01,001),n.minobsinnode=c(2,5))
+set.seed(479); GBM <- train(SalePrice~.,data=TRAIN.CLEAN, method='gbm',tuneGrid=gbmGrid,verbose=FALSE,
+                          trControl=fitControl, preProc = c("center", "scale"))
+GBM$results[rownames(GBM$bestTune),] 
+
+
+#Opportunity for further tuning
+
+
+
+
+KUHR <- gbm(SalePrice~.,data=TRAIN.CLEAN,distribution="gaussian",n.trees=7500,interaction.depth=5,n.minobsinnode = 2,shrinkage=0.01)
+
+summary(KUHR)
+#                         var     rel.inf
+# OverallQual     OverallQual 33.03743987
+# GrLivArea         GrLivArea 17.90110826
+# TotalBsmtSF     TotalBsmtSF  5.73721240
+# GarageCars       GarageCars  3.71239431
+# Neighborhood   Neighborhood  3.64173034
+# X1stFlrSF         X1stFlrSF  3.32606006
+# GarageType       GarageType  3.04569198
+# GarageArea       GarageArea  2.78398615
+# LotArea             LotArea  2.51957195
+# CentralAir       CentralAir  1.99858987
+# YearRemodAdd   YearRemodAdd  1.85164006
+# OverallCond     OverallCond  1.70209189
+# BsmtFinSF1       BsmtFinSF1  1.53975823
+# BsmtQual           BsmtQual  1.33027599
+# YearBuilt         YearBuilt  1.29788772
+# GarageFinish   GarageFinish  1.25154635
+plot(KUHR,"OverallQual")
+FITTED <- plot(KUHR,"OverallQual",return.grid=TRUE)
+plot(I(10^y)~OverallQual,data=FITTED,xlab="Overall Quality (Score 1-10)",type="l",ylab="Selling Price")
+
+plot(KUHR,"GrLivArea")
+plot(KUHR,"GarageCars")
+
+
+knnGrid <- expand.grid(k=c(1,5,10,15,20,25,30))
+set.seed(479); KNN <- train(SalePrice~.,data=TRAIN.CLEAN, method='knn', trControl=fitControl,tuneGrid=knnGrid, preProc = c("center", "scale"))
+
+KNN$results[rownames(KNN$bestTune),]  
+#   k       RMSE  Rsquared        MAE     RMSESD RsquaredSD       MAESD
+#3 10 0.08035638 0.7877496 0.05620465 0.00527017 0.02728013 0.002904725
+
+
+
+
+
+nnetGrid <- expand.grid(size=1:4,decay=10^( seq(-3,-0.5,length=10) ) ) 
+
+#IMPERATIVE to have =FALSE and linout=TRUE for regression; also scaling has to be done of each variable
+set.seed(479);  NNET <- train(SalePrice~.,data=TRAIN.CLEAN,method='nnet',trControl=fitControl,tuneGrid=nnetGrid,
+              trace=FALSE,linout=TRUE,preProc = c("center", "scale"))
+
+
+NNET  #Look at details of all fits
+plot(NNET) #See how error changes with choices
+NNET$bestTune #Gives best parameters
+NNET$results #Look at output in more detail (lets you see SDs)
+NNET$results[rownames(NNET$bestTune),]  #Just the row with the optimal choice of tuning parameter
+
+
+
+
+
+
+#Linear kernel (equivalent to all predictors and all two-way interactions)
+svmLinearGrid <- expand.grid(C=2^(2:8) ) 
+
+
+#If you do NOT want parallelization, then don't run Lines1-4 (but do run train)
+set.seed(479); SVM <- train(SalePrice~.,data=TRAIN.CLEAN,method='svmLinear', trControl=fitControl,tuneGrid = svmLinearGrid,
+                              preProc = c("center", "scale"))
+SVM  #Look at details of all fits
+plot(SVM) #See how error changes with choices
+SVM$bestTune #Gives best parameters
+SVM$results #Look at output in more detail (lets you see SDs)
+SVM$results[rownames(SVM$bestTune),]  #Just the row with the optimal choice of tuning parameter
+
+#  C       RMSE  Rsquared        MAE      RMSESD RsquaredSD       MAESD
+#1 4 0.05634268 0.8909312 0.03630512 0.008633624   0.035922 0.001895493
+
+
+
+
+#Polynomial kernel (equivalent to all predictors and all two-way interactions and predictors raised to degree power)
+svmPolyGrid <- expand.grid(degree=2:3, scale=10^seq(-4,-1,by=1), C=2^(2:4) ) 
+
+
+#If you do NOT want parallelization, then don't run Lines1-4 (but do run train)
+
+set.seed(479); SVMpoly <- train(SalePrice~.,data=TRAIN.CLEAN,method='svmPoly', trControl=fitControl,tuneGrid = svmPolyGrid,
+                              preProc = c("center", "scale"))
+
+
+SVMpoly  #Look at details of all fits
+plot(SVMpoly) #See how error changes with choices
+SVMpoly$bestTune #Gives best parameters
+SVMpoly$results #Look at output in more detail (lets you see SDs)
+SVMpoly$results[rownames(SVMpoly$bestTune),]  #Just the row with the optimal choice of tuning parameter
+
+
+
+
+
+#Radial Basis Kernel (kind of like a locally weighted linear regression; sigma changes size of neighborhood)
+svmRadialGrid <- expand.grid(sigma=10^seq(-4,-1,by=1), C=2^(0:4) ) 
+
+
+set.seed(479); SVMradial <- train(SalePrice~.,data=TRAIN.CLEAN,method='svmRadial', trControl=fitControl,tuneGrid = svmRadialGrid,
+                              preProc = c("center", "scale"))
+
+
+SVMradial  #Look at details of all fits
+plot(SVMradial) #See how error changes with choices
+SVMradial$bestTune #Gives best parameters
+SVMradial$results #Look at output in more detail (lets you see SDs)
+SVMradial$results[rownames(SVMradial$bestTune),]  #Just the row with the optimal choice of tuning parameter
+#  sigma C       RMSE  Rsquared        MAE      RMSESD RsquaredSD       MAESD
+#8 0.001 4 0.05309113 0.9037934 0.03379472 0.005213154 0.02391168 0.001431681
+
+
+
+
+#Step 1 - fix eta at 0.01, the rest of parameters at these values, and tune nrounds
+xgboostGrid <- expand.grid(eta=0.3,nrounds=142,
+                           max_depth=2,min_child_weight=1,gamma=0,colsample_bytree=0.8,subsample=1)
+
+set.seed(479); XTREME <- train(logpickup~.,data=TRAIN.CLEAN,
+                method="xgbTree",
+                trControl=fitControl,
+                tuneGrid=xgboostGrid,
+                preProc = c("center", "scale"),
+                verbose=FALSE)
+
+
+
+XTREME$results[,c(7,8,10)]  #Just the columns we want
+
+
+TRAINXGB <- TRAIN.CLEAN
+#Convert data into sparse model matrix; the -1 is important for bookkeeping
+TRAINXGB <- sparse.model.matrix(SalePrice~.-1,data=TRAINXGB)
+
+XTREM2 <- xgboost(data = TRAINXGB, label = TRAIN.CLEAN$SalePrice, max_depth = 2, eta=0.3, min_child_weight=1, gamma=0, colsample_bytree=0.8,nrounds=142, subsample=1.0)
+
+
+
+
+
+
+
+#Step 2, leave eta fixed at 0.1, use "optimal" nrounds from step 1, tune the othe parameters 
+
+xgboostGrid <- expand.grid(eta=0.1,nrounds=500,
+                           max_depth=c(3,6,9),min_child_weight=1,gamma=c(.1,.5,1,5,10),
+                           colsample_bytree=c(0.6,0.8,1),subsample=c(0.6,0.8,1.0))
+dim(xgboostGrid) #135 models yikes
+
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+
+set.seed(479);  XTREME <- train(x=TRAINXGB,y=TRAIN$Quality,
+                method="xgbTree",
+                trControl=fitControl,
+                tuneGrid=xgboostGrid,
+                preProc = c("center", "scale"),
+                verbose=FALSE)
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+
+TUNE <- XTREME$results[,c(2,3,4,6,8,10)]
+head( TUNE[order(TUNE$Accuracy,decreasing=TRUE),], 15 )
+#    max_depth gamma colsample_bytree subsample  Accuracy AccuracySD
+#97          9   0.1                1       0.6 0.8982652 0.02145847
+#116         9   1.0                1       0.8 0.8948170 0.02075917
+#106         9   0.5                1       0.6 0.8948036 0.02274355
+#54          6   0.1                1       1.0 0.8948023 0.01974425
+
+
+#Step 3:  Lower the learning rate eta to a smaller value, uses the values of the other parameters from step 2, re-tune number of trees
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+
+xgboostGrid <- expand.grid(eta=0.01,nrounds=c(250,500,1000,2500,5000),
+                           max_depth=9,min_child_weight=1,gamma=1,colsample_bytree=1,subsample=.6)
+FINE.XTREME <- train(x=TRAINXGB,y=TRAIN$Quality,
+                method="xgbTree",
+                trControl=fitControl,
+                tuneGrid=xgboostGrid,
+                preProc = c("center", "scale"),
+                verbose=FALSE)
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+#  nrounds  Accuracy   Kappa    
+#   250     0.8800143  0.7469844
+#   500     0.8844564  0.7552670
+#  1000     0.8938403  0.7754157
+#  2500     0.8933441  0.7746320
+#  5000     0.8913675  0.7704410
+
+#Step 4:  keep eta fixed at that smaller value, use "optimal" value of nrounds from step 3, and retune the other parameters
+xgboostGrid <- expand.grid(eta=0.01,nrounds=2500,
+                           max_depth=c(7,9,11),min_child_weight=1,gamma=c(0,.1,1),
+                           colsample_bytree=c(.8,1),subsample=.6)
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+
+FINE.XTREME2 <- train(x=TRAINXGB,y=TRAIN$Quality,
+                method="xgbTree",
+                trControl=fitControl,
+                tuneGrid=xgboostGrid,
+                preProc = c("center", "scale"),
+                verbose=FALSE)
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+#Can iterate steps 3 and 4 until happy.  But this takes a long time
+
+
+#Once done, can get predictions on the holdout sample
+classifications <- predict(FINE.XTREME2,newdata=HOLDOUTXGB)
+confusionMatrix(classifications,HOLDOUT$Quality)
+#          Reference
+#Prediction high low
+#      high  243  27
+#      low    35 370
+#Accuracy : 0.9081     
+probabilities <- predict(FINE.XTREME2,newdata=HOLDOUTXGB,type="prob")
+roc(HOLDOUT$Quality,probabilities[,2])
+#Area under the curve: 0.9693
+
+```
